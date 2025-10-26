@@ -35,7 +35,7 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(mqtt_client mqtt_client.c )
+add_executable(mqtt_client mqtt_client.c inc/ssd1306_i2c.c)
 
 pico_set_program_name(mqtt_client "mqtt_client")
 pico_set_program_version(mqtt_client "0.1")
@@ -48,6 +48,7 @@ pico_enable_stdio_usb(mqtt_client 1)
 target_link_libraries(mqtt_client
     pico_stdlib
     hardware_adc
+    hardware_i2c
     pico_cyw43_arch_lwip_threadsafe_background
     pico_lwip_mqtt
     pico_mbedtls
@@ -61,7 +62,7 @@ target_include_directories(mqtt_client PRIVATE
 
 # Add any user requested libraries
 target_link_libraries(mqtt_client 
-        
+        hardware_i2c
         )
 
 pico_add_extra_outputs(mqtt_client)

@@ -41,6 +41,7 @@
         "cyw43_arch.h": "c",
         "mqtt_priv.h": "c",
         "dns.h": "c",
-        "altcp_tls.h": "c"
+        "altcp_tls.h": "c",
+        "i2c.h": "c"
     }
 }

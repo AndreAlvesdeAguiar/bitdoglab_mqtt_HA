@@ -1,6 +1,11 @@
+// ---- ADIÇÕES PEQUENAS: OLED dinâmico + define MQTT_PORT (sem mexer no MQTT) ----
+// cole este código no seu arquivo, substituindo o main atual
+// Diferenças marcadas com comentários // ADIÇÃO ...
+
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
+#include <stdio.h>
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
 #include "pico/unique_id.h"
@@ -11,11 +16,18 @@
 #include "lwip/apps/mqtt_priv.h"
 #include "lwip/dns.h"
 #include "lwip/altcp_tls.h"
+#include "pico/binary_info.h"
+#include "inc/ssd1306.h"
+#include "hardware/i2c.h"
 
-#define WIFI_SSID "SSID_AQUI"
-#define WIFI_PASSWORD "SENHA_WIFI_AQUI"
-#define MQTT_USERNAME "USUARIO_MQTT"
-#define MQTT_PASSWORD "SENHA_MQTT"
+const uint I2C_SDA = 14;
+const uint I2C_SCL = 15;
+
+#define WIFI_SSID "AGUIA 2.4G"
+#define WIFI_PASSWORD "Leticia150789"
+#define MQTT_SERVER "192.168.15.35"
+#define MQTT_USERNAME "esp32"
+#define MQTT_PASSWORD "SENHA_FORTE"
 
 #ifndef TEMPERATURE_UNITS
 #define TEMPERATURE_UNITS 'C'
@@ -23,6 +35,11 @@
 
 #ifndef MQTT_SERVER
 #error Need to define MQTT_SERVER
+#endif
+
+// ADIÇÃO: garante porta padrão sem alterar a lógica do seu MQTT
+#ifndef MQTT_PORT
+#define MQTT_PORT 1883
 #endif
 
 #ifdef MQTT_CERT_INC
@@ -99,14 +116,68 @@ static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection
 static void start_client(MQTT_CLIENT_DATA_T *state);
 static void dns_found(const char *hostname, const ip_addr_t *ipaddr, void *arg);
 
+// ---------------- OLED helpers (ADIÇÃO) ----------------
+static inline void oled_clear_full(uint8_t *buf, struct render_area *area) {
+    memset(buf, 0, ssd1306_buffer_length);
+    render_on_display(buf, area);
+}
+
+static void oled_print_temp(uint8_t *buf, struct render_area *area, float tC) {
+    char line1[22], line2[22];
+    // Cabeçalho curto para manter 2 linhas legíveis
+    snprintf(line1, sizeof(line1), "  BitDogLab ");
+    snprintf(line2, sizeof(line2), "  Temp: %.2f %s", tC, (TEMPERATURE_UNITS=='F') ? "F" : "C");
+
+    memset(buf, 0, ssd1306_buffer_length);
+    int y = 0;
+    ssd1306_draw_string(buf, 0, y, line1); y += 8;
+    ssd1306_draw_string(buf, 0, y, line2);
+    render_on_display(buf, area);
+}
+
+// ---------------- MAIN ----------------
 int main(void) {
     stdio_init_all();
-    INFO_printf("mqtt client starting\n");
 
+    // ---------- OLED ----------
+    INFO_printf("OLED init...\n");
+    i2c_init(i2c1, ssd1306_i2c_clock * 1000);
+    gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA);
+    gpio_pull_up(I2C_SCL);
+
+    ssd1306_init();
+
+    struct render_area frame_area = {
+        .start_column = 0,
+        .end_column   = ssd1306_width - 1,
+        .start_page   = 0,
+        .end_page     = ssd1306_n_pages - 1
+    };
+    calculate_render_area_buffer_length(&frame_area);
+
+    static uint8_t ssd[ssd1306_buffer_length];
+    oled_clear_full(ssd, &frame_area);
+
+    // Mensagem inicial estática
+    {
+        char *text[] = { " PAZ! E VIDA LONGA  " };
+        int y = 0;
+        for (uint i = 0; i < count_of(text); i++) {
+            ssd1306_draw_string(ssd, 5, y, text[i]);
+            y += 8;
+        }
+        render_on_display(ssd, &frame_area);
+    }
+
+    // ---------- ADC para temperatura onboard ----------
     adc_init();
     adc_set_temp_sensor_enabled(true);
     adc_select_input(4);
 
+    // ---------- Wi-Fi + MQTT (SEM MEXER NA LÓGICA) ----------
+    INFO_printf("MQTT init...\n");
     static MQTT_CLIENT_DATA_T state;
 
     if (cyw43_arch_init()) {
@@ -162,15 +233,26 @@ int main(void) {
         panic("dns request failed");
     }
 
+    // --------- LOOP: mantém poll do Wi-Fi/MQTT e atualiza o OLED a cada 1s (ADIÇÃO) ---------
+    absolute_time_t next_oled = make_timeout_time_ms(0);
     while (!state.connect_done || mqtt_client_is_connected(state.mqtt_client_inst)) {
         cyw43_arch_poll();
-        cyw43_arch_wait_for_work_until(make_timeout_time_ms(100));
+        // Atualização OLED (não bloqueia, sem alterar MQTT)
+        if (absolute_time_diff_us(get_absolute_time(), next_oled) <= 0) {
+            float t = read_onboard_temperature(TEMPERATURE_UNITS);
+            // se pediu F, converte aqui para exibir coerente
+            if (TEMPERATURE_UNITS == 'F') t = t * 9.0f/5.0f + 32.0f;
+            oled_print_temp(ssd, &frame_area, t);
+            next_oled = make_timeout_time_ms(1000);
+        }
+        cyw43_arch_wait_for_work_until(make_timeout_time_ms(50));
     }
 
     INFO_printf("mqtt client exiting\n");
     return 0;
 }
 
+// ---------------- Funções já existentes (sem alteração) ----------------
 static float read_onboard_temperature(const char unit) {
     const float conversionFactor = 3.3f / (1 << 12);
     float adc_v = (float)adc_read() * conversionFactor;
@@ -349,4 +431,3 @@ static void dns_found(const char *hostname, const ip_addr_t *ipaddr, void *arg) 
         panic("dns request failed");
     }
 }
-
