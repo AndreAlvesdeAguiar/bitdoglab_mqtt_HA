@@ -27,12 +27,11 @@
 const uint I2C_SDA = 14;
 const uint I2C_SCL = 15;
 
-// ===================== Wi-Fi / MQTT =====================
-#define WIFI_SSID     "AGUIA 2.4G"
-#define WIFI_PASSWORD "Leticia150789"
-#define MQTT_SERVER   "192.168.15.35"
-#define MQTT_USERNAME "esp32"
-#define MQTT_PASSWORD "SENHA_FORTE"
+#define WIFI_SSID "xxxxxx"
+#define WIFI_PASSWORD "xxxxx"
+#define MQTT_SERVER "xxxxx"
+#define MQTT_USERNAME "xxxx"
+#define MQTT_PASSWORD "xxxxx"
 
 #ifndef TEMPERATURE_UNITS
 #define TEMPERATURE_UNITS 'C'
