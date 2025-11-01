@@ -1,10 +1,19 @@
-// ---- OLED dinâmico + MQTT com ESP32 (quarto/sala) + temp onboard ----
-// Arquivo completo
+// ---- BitDogLab: OLED dinâmico + MQTT + temp onboard + UART0 (GPS do ESP32) ----
+// Ligações UART:
+//   BitDogLab GPIO1 (RX0) <- ESP32 TX1 (GPIO4)
+//   BitDogLab GPIO0 (TX0) -> ESP32 RX1 (GPIO5) [opcional]
+//   GND em comum
+//
+// Formato esperado da linha vinda do ESP32 (terminada em '\n'):
+//   LAT=<float>,LON=<float>,SAT=<int>,ALT=<float>
+//
+// Tela do OLED passa a ter: 0=onboard, 1=quarto, 2=sala, 3=gps
 
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
@@ -14,6 +23,7 @@
 #include "hardware/irq.h"
 #include "hardware/adc.h"
 #include "hardware/i2c.h"
+#include "hardware/uart.h"
 
 #include "lwip/apps/mqtt.h"
 #include "lwip/apps/mqtt_priv.h"
@@ -23,15 +33,22 @@
 #include "pico/binary_info.h"
 #include "inc/ssd1306.h"
 
-// ===================== Pinos OLED =====================
+// ===================== Pinos OLED (I2C1, como no seu código) =====================
 const uint I2C_SDA = 14;
 const uint I2C_SCL = 15;
 
-#define WIFI_SSID "xxxxxx"
-#define WIFI_PASSWORD "xxxxx"
-#define MQTT_SERVER "xxxxx"
-#define MQTT_USERNAME "xxxx"
-#define MQTT_PASSWORD "xxxxx"
+// ===================== UART0 (RX/TX no conector J6) =====================
+#define GPS_UART        uart0
+#define GPS_UART_TX_PIN 0   // BitDogLab TX0  -> ESP32 RX (opcional)
+#define GPS_UART_RX_PIN 1   // BitDogLab RX0  <- ESP32 TX (OBRIGATÓRIO)
+#define GPS_UART_BAUD   115200
+
+// ===================== Wi-Fi/MQTT =====================
+#define WIFI_SSID "x"
+#define WIFI_PASSWORD "x"
+#define MQTT_SERVER "x"
+#define MQTT_USERNAME "x"
+#define MQTT_PASSWORD "x"
 
 #ifndef TEMPERATURE_UNITS
 #define TEMPERATURE_UNITS 'C'
@@ -62,7 +79,7 @@ const uint I2C_SCL = 15;
 // Assinar todos os ESPs que publicam JSON de estado
 #define ESP_STATE_WILDCARD  "home/+/state"
 
-// *** ATENÇÃO ***: coloque aqui os nomes EXATOS dos seus ESPs (DEVICE_NAME do código ESP32)
+// *** coloque aqui os nomes EXATOS dos seus ESPs ***
 #define ESP_DEV_QUARTO   "esp32-aht10-quarto"
 #define ESP_DEV_SALA     "esp32-aht10-sala"
 
@@ -112,7 +129,7 @@ typedef struct {
 #define MQTT_UNIQUE_TOPIC 0
 #endif
 
-// ===== Estado de cada ESP que queremos mostrar =====
+// ===== Estado dos ESPs (quarto/sala) =====
 typedef struct {
     float temp;
     float hum;
@@ -122,6 +139,19 @@ typedef struct {
 
 static ROOM_STATE_T s_quarto = {0};
 static ROOM_STATE_T s_sala   = {0};
+
+// ===== Estado vindo do ESP (GPS via UART0) =====
+typedef struct {
+    double lat;
+    double lon;
+    double alt;
+    int    sats;
+    bool   has_fix;       // considera fix se lat/lon válidos
+    bool   has_any;
+    absolute_time_t last_update;
+} ESP_GPS_STATE_T;
+
+static ESP_GPS_STATE_T s_gps_esp = {0};
 
 // ===================== Forward decls =====================
 static float read_onboard_temperature(const char unit);
@@ -168,6 +198,24 @@ static void oled_print_room(uint8_t *buf, struct render_area *area, const char *
     oled_print_2lines(buf, area, line1, line2);
 }
 
+static void oled_print_gps_esp(uint8_t *buf, struct render_area *area) {
+    char l1[22], l2[22];
+    bool fresh = s_gps_esp.has_any &&
+                 absolute_time_diff_us(s_gps_esp.last_update, get_absolute_time()) <= 15 * 1000000LL;
+    if (!fresh) {
+        snprintf(l1, sizeof(l1), "GPS (ESP) ...");
+        snprintf(l2, sizeof(l2), "sem dados");
+    } else if (!s_gps_esp.has_fix) {
+        snprintf(l1, sizeof(l1), "GPS ESP sem FIX");
+        snprintf(l2, sizeof(l2), "Sat:%d", s_gps_esp.sats);
+    } else {
+        // Lat/Lon compactos
+        snprintf(l1, sizeof(l1), "Lat:% .4f", s_gps_esp.lat);
+        snprintf(l2, sizeof(l2), "Lon:% .4f", s_gps_esp.lon);
+    }
+    oled_print_2lines(buf, area, l1, l2);
+}
+
 // ===================== JSON/Topic helpers =====================
 // Extrai float de JSON simples: {"temperature":12.34,"humidity":56.78}
 static bool json_extract_float(const char *json, const char *key, float *out) {
@@ -199,9 +247,65 @@ static bool topic_is_esp_state(const char *topic, char *dev_out, size_t dev_len)
     return true;
 }
 
+// ===================== Parser da linha do ESP (UART0) =====================
+// Aceita chaves em qualquer ordem: LAT=...,LON=...,SAT=...,ALT=...
+static void gps_esp_parse_line(const char *line) {
+    if (!line || !*line) return;
+
+    // Faz uma cópia editável
+    char buf[160];
+    strncpy(buf, line, sizeof(buf)-1);
+    buf[sizeof(buf)-1] = 0;
+
+    // Tokeniza por vírgula
+    double lat = NAN, lon = NAN, alt = NAN;
+    int sats = 0;
+
+    char *saveptr = NULL;
+    char *tok = strtok_r(buf, ",", &saveptr);
+    while (tok) {
+        // Remove espaços
+        while (*tok == ' ') tok++;
+        char *eq = strchr(tok, '=');
+        if (eq) {
+            *eq = 0;
+            const char *k = tok;
+            const char *v = eq + 1;
+            if (strcasecmp(k, "LAT") == 0) {
+                lat = strtod(v, NULL);
+            } else if (strcasecmp(k, "LON") == 0) {
+                lon = strtod(v, NULL);
+            } else if (strcasecmp(k, "SAT") == 0 || strcasecmp(k, "SATS") == 0) {
+                sats = atoi(v);
+            } else if (strcasecmp(k, "ALT") == 0 || strcasecmp(k, "ALTITUDE") == 0) {
+                alt = strtod(v, NULL);
+            }
+        }
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+
+    s_gps_esp.lat = lat;
+    s_gps_esp.lon = lon;
+    s_gps_esp.alt = alt;
+    s_gps_esp.sats = sats;
+    s_gps_esp.has_fix = !(isnan(lat) || isnan(lon));
+    s_gps_esp.has_any = true;
+    s_gps_esp.last_update = get_absolute_time();
+
+    INFO_printf("GPS(ESP) -> lat=%.6f lon=%.6f sats=%d alt=%.1f\n",
+                s_gps_esp.lat, s_gps_esp.lon, s_gps_esp.sats, s_gps_esp.alt);
+}
+
 // ===================== MAIN =====================
 int main(void) {
     stdio_init_all();
+
+    // ---------- UART0 (GPIO0/1) ----------
+    uart_init(GPS_UART, GPS_UART_BAUD);
+    gpio_set_function(GPS_UART_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(GPS_UART_RX_PIN, GPIO_FUNC_UART);
+    uart_set_hw_flow(GPS_UART, false, false);
+    uart_set_format(GPS_UART, 8, 1, UART_PARITY_NONE);
 
     // ---------- OLED ----------
     INFO_printf("OLED init...\n");
@@ -289,40 +393,65 @@ int main(void) {
 
     // --------- LOOP: atualiza OLED a cada 1s alternando telas ---------
     absolute_time_t next_oled = make_timeout_time_ms(0);
-    uint8_t screen = 0; // 0=onboard, 1=quarto, 2=sala
+    uint8_t screen = 0; // 0=onboard, 1=quarto, 2=sala, 3=gps
+
+    // Buffer de linha da UART (GPS do ESP)
+    char uart_line[160];
+    size_t uart_len = 0;
 
     while (!state.connect_done || mqtt_client_is_connected(state.mqtt_client_inst)) {
         cyw43_arch_poll();
 
+        // --- UART0: lê caracteres e monta linhas ---
+        while (uart_is_readable(GPS_UART)) {
+            char c = (char)uart_getc(GPS_UART);
+            if (c == '\r') continue;
+            if (c == '\n') {
+                uart_line[uart_len] = 0;
+                if (uart_len > 0) {
+                    gps_esp_parse_line(uart_line);
+                }
+                uart_len = 0;
+            } else if (uart_len < sizeof(uart_line) - 1) {
+                uart_line[uart_len++] = c;
+            } else {
+                // overflow -> zera
+                uart_len = 0;
+            }
+        }
+
         if (absolute_time_diff_us(get_absolute_time(), next_oled) <= 0) {
-            // decide o que mostrar (dados recentes <=20s)
+            // dados recentes <=20s
             bool quarto_ok = s_quarto.has_data &&
                              absolute_time_diff_us(s_quarto.last_update, get_absolute_time()) <= 20 * 1000000LL;
             bool sala_ok   = s_sala.has_data &&
                              absolute_time_diff_us(s_sala.last_update,   get_absolute_time()) <= 20 * 1000000LL;
+            bool gps_ok    = s_gps_esp.has_any &&
+                             absolute_time_diff_us(s_gps_esp.last_update, get_absolute_time()) <= 15 * 1000000LL;
 
-            // rota simples: onboard -> quarto (se ok) -> sala (se ok)
             if (screen == 0) {
                 float t = read_onboard_temperature(TEMPERATURE_UNITS);
                 if (TEMPERATURE_UNITS == 'F') t = t * 9.0f/5.0f + 32.0f;
                 oled_print_onboard(ssd, &frame_area, t);
-                screen = quarto_ok ? 1 : (sala_ok ? 2 : 0);
+                screen = quarto_ok ? 1 : (sala_ok ? 2 : 3);
             } else if (screen == 1) {
                 if (quarto_ok) {
                     oled_print_room(ssd, &frame_area, "QUARTO", s_quarto.temp, s_quarto.hum);
-                    screen = sala_ok ? 2 : 0;
+                    screen = sala_ok ? 2 : 3;
                 } else {
-                    screen = 0;
-                    continue; // desenha onboard imediatamente no próximo tick
+                    screen = sala_ok ? 2 : 3;
+                    // continue; // se quiser pular pro próximo tick
                 }
-            } else { // screen == 2
+            } else if (screen == 2) {
                 if (sala_ok) {
                     oled_print_room(ssd, &frame_area, "SALA", s_sala.temp, s_sala.hum);
-                    screen = 0;
+                    screen = 3;
                 } else {
-                    screen = 0;
-                    continue;
+                    screen = 3;
                 }
+            } else { // screen == 3 (GPS do ESP)
+                oled_print_gps_esp(ssd, &frame_area);
+                screen = 0;
             }
 
             next_oled = make_timeout_time_ms(1000);
