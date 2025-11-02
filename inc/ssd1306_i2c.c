@@ -8,23 +8,15 @@
 #include "ssd1306_font.h"
 #include "ssd1306_i2c.h"
 
-// topo do ssd1306_i2c.c
-static i2c_inst_t* SSD_I2C = NULL;
-
-void ssd1306_set_i2c(i2c_inst_t* i2c){
-    SSD_I2C = i2c;
-}
-
-
 // Calcular quanto do buffer será destinado à área de renderização
 void calculate_render_area_buffer_length(struct render_area *area) {
     area->buffer_length = (area->end_column - area->start_column + 1) * (area->end_page - area->start_page + 1);
 }
 
-// onde tinha i2c1, use SSD_I2C
-void ssd1306_send_command(uint8_t command){
+// Processo de escrita do i2c espera um byte de controle, seguido por dados
+void ssd1306_send_command(uint8_t command) {
     uint8_t buffer[2] = {0x80, command};
-    i2c_write_blocking(SSD_I2C, ssd1306_i2c_address, buffer, 2, false);
+    i2c_write_blocking(i2c1, ssd1306_i2c_address, buffer, 2, false);
 }
 
 // Envia uma lista de comandos ao hardware
@@ -34,13 +26,18 @@ void ssd1306_send_command_list(uint8_t *ssd, int number) {
     }
 }
 
-void ssd1306_send_buffer(uint8_t ssd[], int n){
-    uint8_t *tmp = malloc(n + 1);
-    tmp[0] = 0x40;
-    memcpy(tmp + 1, ssd, n);
-    i2c_write_blocking(SSD_I2C, ssd1306_i2c_address, tmp, n + 1, false);
-    free(tmp);
+// Copia buffer de referência num novo buffer, a fim de adicionar o byte de controle desde o início
+void ssd1306_send_buffer(uint8_t ssd[], int buffer_length) {
+    uint8_t *temp_buffer = malloc(buffer_length + 1);
+
+    temp_buffer[0] = 0x40;
+    memcpy(temp_buffer + 1, ssd, buffer_length);
+
+    i2c_write_blocking(i2c1, ssd1306_i2c_address, temp_buffer, buffer_length + 1, false);
+
+    free(temp_buffer);
 }
+
 // Cria a lista de comandos (com base nos endereços definidos em ssd1306_i2c.h) para a inicialização do display
 void ssd1306_init() {
     uint8_t commands[] = {
