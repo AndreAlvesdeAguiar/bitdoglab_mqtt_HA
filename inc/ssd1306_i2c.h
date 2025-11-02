@@ -47,6 +47,9 @@
 #define ssd1306_write_mode _u(0xFE)
 #define ssd1306_read_mode _u(0xFF)
 
+
+void ssd1306_set_i2c(i2c_inst_t* i2c);
+
 struct render_area {
     uint8_t start_column;
     uint8_t end_column;

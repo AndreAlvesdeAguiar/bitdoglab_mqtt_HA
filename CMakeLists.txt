@@ -35,7 +35,7 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(mqtt_client mqtt_client.c inc/ssd1306_i2c.c)
+add_executable(mqtt_client mqtt_client.c inc/ssd1306_i2c.c aht10.c bmp280.c) 
 
 pico_set_program_name(mqtt_client "mqtt_client")
 pico_set_program_version(mqtt_client "0.1")

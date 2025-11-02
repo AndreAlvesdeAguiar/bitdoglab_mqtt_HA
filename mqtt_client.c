@@ -7,7 +7,7 @@
 // Formato esperado da linha vinda do ESP32 (terminada em '\n'):
 //   LAT=<float>,LON=<float>,SAT=<int>,ALT=<float>
 //
-// Tela do OLED passa a ter: 0=onboard, 1=quarto, 2=sala, 3=gps
+// Tela do OLED passa a ter: 0=onboard, 1=quarto, 2=sala, 3=gps, 4=aht10
 
 #include <string.h>
 #include <ctype.h>
@@ -33,9 +33,9 @@
 #include "pico/binary_info.h"
 #include "inc/ssd1306.h"
 
-// ===================== Pinos OLED (I2C1, como no seu código) =====================
-const uint I2C_SDA = 14;
-const uint I2C_SCL = 15;
+#include "aht10.h"  // <-- AHT10
+#include "bmp280.h"  // <<< precisa deste include para bmp280_calib_params_t e funções
+
 
 // ===================== UART0 (RX/TX no conector J6) =====================
 #define GPS_UART        uart0
@@ -44,11 +44,11 @@ const uint I2C_SCL = 15;
 #define GPS_UART_BAUD   115200
 
 // ===================== Wi-Fi/MQTT =====================
-#define WIFI_SSID "x"
-#define WIFI_PASSWORD "x"
-#define MQTT_SERVER "x"
-#define MQTT_USERNAME "x"
-#define MQTT_PASSWORD "x"
+#define WIFI_SSID "AGUIA 2.4G"
+#define WIFI_PASSWORD "Leticia150789"
+#define MQTT_SERVER "192.168.15.35"
+#define MQTT_USERNAME "esp32"
+#define MQTT_PASSWORD "SENHA_FORTE"
 
 #ifndef TEMPERATURE_UNITS
 #define TEMPERATURE_UNITS 'C'
@@ -153,6 +153,33 @@ typedef struct {
 
 static ESP_GPS_STATE_T s_gps_esp = {0};
 
+// ===== Estado local do bmp280 =====
+
+typedef struct {
+    float temp_c;
+    float press_hpa;
+    bool  ok;
+    absolute_time_t last_update;
+} BMP_STATE_T;
+
+static BMP_STATE_T s_bmp = {0};
+static bool s_bmp_present = false;
+
+
+// ===== Estado local do AHT10 =====
+typedef struct {
+    float temp;
+    float hum;
+    bool  ok;
+    absolute_time_t last_update;
+} AHT_STATE_T;
+
+static AHT_STATE_T s_aht = {0};
+static bool s_aht_present = false;
+
+// ===== Scanner I2C opcional (1 = ativado) =====
+#define RUN_I2C_SCAN 1
+
 // ===================== Forward decls =====================
 static float read_onboard_temperature(const char unit);
 static void pub_request_cb(__unused void *arg, err_t err);
@@ -215,6 +242,42 @@ static void oled_print_gps_esp(uint8_t *buf, struct render_area *area) {
     }
     oled_print_2lines(buf, area, l1, l2);
 }
+
+static void oled_print_aht10(uint8_t *buf, struct render_area *area) {
+    char l1[22], l2[22];
+    bool fresh = s_aht.ok &&
+                 absolute_time_diff_us(s_aht.last_update, get_absolute_time()) <= 20 * 1000000LL;
+    if (!s_aht_present) {
+        snprintf(l1, sizeof(l1), "AHT10 ausente");
+        snprintf(l2, sizeof(l2), "verifique I2C");
+    } else if (!fresh) {
+        snprintf(l1, sizeof(l1), "AHT10 ...");
+        snprintf(l2, sizeof(l2), "sem dados");
+    } else {
+        snprintf(l1, sizeof(l1), "AHT10 LOCAL");
+        snprintf(l2, sizeof(l2), "T:%.1fC H:%.0f%%", s_aht.temp, s_aht.hum);
+    }
+    oled_print_2lines(buf, area, l1, l2);
+}
+
+static void oled_print_bmp280(uint8_t *buf, struct render_area *area) {
+    char l1[22], l2[22];
+    bool fresh = s_bmp.ok &&
+                 absolute_time_diff_us(s_bmp.last_update, get_absolute_time()) <= 20 * 1000000LL;
+
+    if (!s_bmp_present) {
+        snprintf(l1, sizeof l1, "BMP280 ausente");
+        snprintf(l2, sizeof l2, "verifique I2C");
+    } else if (!fresh) {
+        snprintf(l1, sizeof l1, "BMP280 ...");
+        snprintf(l2, sizeof l2, "sem dados");
+    } else {
+        snprintf(l1, sizeof l1, "BMP280");
+        snprintf(l2, sizeof l2, "P:%5.1f hPa T:%.1fC", s_bmp.press_hpa, s_bmp.temp_c);
+    }
+    oled_print_2lines(buf, area, l1, l2);
+}
+
 
 // ===================== JSON/Topic helpers =====================
 // Extrai float de JSON simples: {"temperature":12.34,"humidity":56.78}
@@ -300,6 +363,7 @@ static void gps_esp_parse_line(const char *line) {
 int main(void) {
     stdio_init_all();
 
+
     // ---------- UART0 (GPIO0/1) ----------
     uart_init(GPS_UART, GPS_UART_BAUD);
     gpio_set_function(GPS_UART_TX_PIN, GPIO_FUNC_UART);
@@ -307,15 +371,23 @@ int main(void) {
     uart_set_hw_flow(GPS_UART, false, false);
     uart_set_format(GPS_UART, 8, 1, UART_PARITY_NONE);
 
-    // ---------- OLED ----------
+    // ---------- OLED / I2C ----------
     INFO_printf("OLED init...\n");
-    i2c_init(i2c1, ssd1306_i2c_clock * 1000);
-    gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
-    gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_SDA);
-    gpio_pull_up(I2C_SCL);
+
+    i2c_init(i2c1, 100 * 1000);
+
+    gpio_set_function(2, GPIO_FUNC_I2C);
+    gpio_set_function(3, GPIO_FUNC_I2C);
+    gpio_pull_up(2);
+    gpio_pull_up(3);
 
     ssd1306_init();
+    // ---------- BMP280 (mesma I2C do OLED) ----------
+    INFO_printf("BMP280 init...\n");
+    bmp280_init(i2c1);                         // usa endereço padrão (0x76). Se o seu for 0x77, ajuste no driver.
+    bmp280_calib_params_t bmp_params;
+    bmp280_get_calib_params(i2c1, &bmp_params);
+    s_bmp_present = true;                      // se quiser, valide lendo quem_sou (chip_id) no driver
 
     struct render_area frame_area = {
         .start_column = 0,
@@ -335,6 +407,26 @@ int main(void) {
     adc_init();
     adc_set_temp_sensor_enabled(true);
     adc_select_input(4);
+
+    // Pequeno atraso para o AHT10 "acordar" no barramento
+    sleep_ms(40);
+
+#if RUN_I2C_SCAN
+    for (int addr = 0; addr < 128; addr++) {
+        int ret = i2c_write_blocking(i2c1, addr, NULL, 0, false);
+        if (ret >= 0) {
+            INFO_printf("I2C found 0x%02X\n", addr);
+        }
+    }
+#endif
+
+
+    // AHT10 init no mesmo I2C usado pelo OLED
+    s_aht_present = aht10_init(i2c1);
+    if (!s_aht_present) {
+        INFO_printf("AHT10 NAO encontrado (0x38). Continuando sem ele.\n");
+    }
+    INFO_printf("AHT10 init...\n");
 
     // ---------- Wi-Fi + MQTT ----------
     INFO_printf("MQTT init...\n");
@@ -393,7 +485,10 @@ int main(void) {
 
     // --------- LOOP: atualiza OLED a cada 1s alternando telas ---------
     absolute_time_t next_oled = make_timeout_time_ms(0);
-    uint8_t screen = 0; // 0=onboard, 1=quarto, 2=sala, 3=gps
+    absolute_time_t next_aht_read = make_timeout_time_ms(0); // primeira leitura já
+    absolute_time_t next_bmp_read = make_timeout_time_ms(0);
+
+    uint8_t screen = 0; // 0=onboard, 1=quarto, 2=sala, 3=gps, 4=aht10
 
     // Buffer de linha da UART (GPS do ESP)
     char uart_line[160];
@@ -401,6 +496,50 @@ int main(void) {
 
     while (!state.connect_done || mqtt_client_is_connected(state.mqtt_client_inst)) {
         cyw43_arch_poll();
+
+        // --- AHT10: leitura periódica (~2s), se presente ---
+        if (s_aht_present && absolute_time_diff_us(get_absolute_time(), next_aht_read) <= 0) {
+            aht10_data_t d;
+            if (aht10_read_data(i2c1, &d)) {
+                s_aht.temp = d.temperature;
+                s_aht.hum  = d.humidity;
+                s_aht.ok   = true;
+                s_aht.last_update = get_absolute_time();
+                INFO_printf("AHT10 LOCAL -> T=%.2f C  H=%.2f %%\n", s_aht.temp, s_aht.hum);
+            } else {
+                s_aht.ok = false;
+                INFO_printf("AHT10 LOCAL -> falha na leitura\n");
+            }
+            
+            next_aht_read = make_timeout_time_ms(2000);
+        }
+
+        // --- BMP280: leitura periódica (~2s), se presente ---
+        if (s_bmp_present && absolute_time_diff_us(get_absolute_time(), next_bmp_read) <= 0) {
+            int32_t raw_t = 0, raw_p = 0;
+            bmp280_calib_params_t params;
+
+            // Atualiza calibração (pode ser feito só 1x no init se preferir)
+            bmp280_get_calib_params(i2c1, &params);
+
+            // Neste driver, bmp280_read_raw(...) é void — apenas preenche raw_t/raw_p
+            bmp280_read_raw(i2c1, &raw_t, &raw_p);
+
+            // Converte usando os helpers do driver
+            int32_t t100 = bmp280_convert_temp(raw_t, &params);     // centésimos de °C
+            int32_t p256 = bmp280_convert_pressure(raw_p, &params); // Q24.8 -> Pa
+
+            s_bmp.temp_c    = t100 / 100.0f;
+            s_bmp.press_hpa = (p256 / 256.0f) / 100.0f;             // Pa -> hPa
+            s_bmp.ok        = true;
+            s_bmp.last_update = get_absolute_time();
+
+            INFO_printf("BMP280 -> %.2f C | %.2f hPa\n", s_bmp.temp_c, s_bmp.press_hpa);
+
+            next_bmp_read = make_timeout_time_ms(2000);
+        }
+
+
 
         // --- UART0: lê caracteres e monta linhas ---
         while (uart_is_readable(GPS_UART)) {
@@ -421,42 +560,72 @@ int main(void) {
         }
 
         if (absolute_time_diff_us(get_absolute_time(), next_oled) <= 0) {
-            // dados recentes <=20s
+            // dados recentes
             bool quarto_ok = s_quarto.has_data &&
-                             absolute_time_diff_us(s_quarto.last_update, get_absolute_time()) <= 20 * 1000000LL;
+                            absolute_time_diff_us(s_quarto.last_update, get_absolute_time()) <= 20 * 1000000LL;
             bool sala_ok   = s_sala.has_data &&
-                             absolute_time_diff_us(s_sala.last_update,   get_absolute_time()) <= 20 * 1000000LL;
+                            absolute_time_diff_us(s_sala.last_update,   get_absolute_time()) <= 20 * 1000000LL;
             bool gps_ok    = s_gps_esp.has_any &&
-                             absolute_time_diff_us(s_gps_esp.last_update, get_absolute_time()) <= 15 * 1000000LL;
+                            absolute_time_diff_us(s_gps_esp.last_update, get_absolute_time()) <= 15 * 1000000LL;
+            bool aht_ok    = s_aht_present && s_aht.ok &&
+                            absolute_time_diff_us(s_aht.last_update, get_absolute_time()) <= 20 * 1000000LL;
+            bool bmp_ok    = s_bmp_present && s_bmp.ok &&
+                            absolute_time_diff_us(s_bmp.last_update, get_absolute_time()) <= 20 * 1000000LL;
 
-            if (screen == 0) {
-                float t = read_onboard_temperature(TEMPERATURE_UNITS);
-                if (TEMPERATURE_UNITS == 'F') t = t * 9.0f/5.0f + 32.0f;
-                oled_print_onboard(ssd, &frame_area, t);
-                screen = quarto_ok ? 1 : (sala_ok ? 2 : 3);
-            } else if (screen == 1) {
-                if (quarto_ok) {
-                    oled_print_room(ssd, &frame_area, "QUARTO", s_quarto.temp, s_quarto.hum);
+                        // ... dentro do bloco if (absolute_time_diff_us(get_absolute_time(), next_oled) <= 0) {
+            for (int tries = 0; tries < 6; tries++) {
+                if (screen == 0) { // ONBOARD
+                    float t = read_onboard_temperature(TEMPERATURE_UNITS);
+                    if (TEMPERATURE_UNITS == 'F') t = t * 9.0f/5.0f + 32.0f;
+                    oled_print_onboard(ssd, &frame_area, t);
+                    // próxima: 1(quarto) -> 2(sala) -> 3(gps) -> 4(AHT SEMPRE) -> 5(bmp)
+                    screen = quarto_ok ? 1 : (sala_ok ? 2 : 3);
+                    break;
+
+                } else if (screen == 1) { // QUARTO
+                    if (quarto_ok) {
+                        oled_print_room(ssd, &frame_area, "QUARTO", s_quarto.temp, s_quarto.hum);
+                    }
                     screen = sala_ok ? 2 : 3;
-                } else {
-                    screen = sala_ok ? 2 : 3;
-                    // continue; // se quiser pular pro próximo tick
-                }
-            } else if (screen == 2) {
-                if (sala_ok) {
-                    oled_print_room(ssd, &frame_area, "SALA", s_sala.temp, s_sala.hum);
+                    break;
+
+                } else if (screen == 2) { // SALA
+                    if (sala_ok) {
+                        oled_print_room(ssd, &frame_area, "SALA", s_sala.temp, s_sala.hum);
+                    }
                     screen = 3;
-                } else {
-                    screen = 3;
+                    break;
+
+                } else if (screen == 3) { // GPS
+                    if (gps_ok) {
+                        oled_print_gps_esp(ssd, &frame_area);
+                    } else {
+                        // mesmo sem fix/dados, a função mostra msg "sem dados"
+                        oled_print_gps_esp(ssd, &frame_area);
+                    }
+                    // >>> SEMPRE ir para AHT10
+                    screen = 4;
+                    break;
+
+                } else if (screen == 4) { // AHT10 (SEMPRE MOSTRAR)
+                    // Chama SEMPRE: a função já trata "ausente" ou "sem dados"
+                    oled_print_aht10(ssd, &frame_area);
+                    screen = bmp_ok ? 5 : 0;
+                    break;
+
+                } else { // 5 = BMP280
+                    if (bmp_ok) {
+                        oled_print_bmp280(ssd, &frame_area);
+                    } else {
+                        // mostra "ausente/sem dados"
+                        oled_print_bmp280(ssd, &frame_area);
+                    }
+                    screen = 0;
+                    break;
                 }
-            } else { // screen == 3 (GPS do ESP)
-                oled_print_gps_esp(ssd, &frame_area);
-                screen = 0;
             }
-
             next_oled = make_timeout_time_ms(1000);
         }
-
         cyw43_arch_wait_for_work_until(make_timeout_time_ms(50));
     }
 
